@@ -14,7 +14,7 @@
 
 export PATH="$HOME/.local/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
-readonly OVOSCTL="$HOME/.local/bin/ovosctl"
+readonly OVOSCTL="$(command -v ovosctl)"
 readonly HELPER="$HOME/.config/ovos-installer/ovos-launchd.zsh"
 # Must stay in sync with LOG_DIR in ovosctl.
 readonly LOG_DIR="$HOME/.local/state/mycroft/logs"
