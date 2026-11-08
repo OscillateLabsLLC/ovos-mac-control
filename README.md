@@ -20,8 +20,11 @@ which otherwise makes `bootstrap` fail with a bare `Input/output error`.
 ## Install
 
 ```zsh
+brew trust --formula oscillatelabsllc/tap/ovos-mac-control
 brew install oscillatelabsllc/tap/ovos-mac-control
 ```
+
+Homebrew requires the trust step for formulae from third-party taps.
 
 Or from a checkout:
 
