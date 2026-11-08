@@ -20,6 +20,12 @@ which otherwise makes `bootstrap` fail with a bare `Input/output error`.
 ## Install
 
 ```zsh
+brew install oscillatelabsllc/tap/ovos-mac-control
+```
+
+Or from a checkout:
+
+```zsh
 ln -sf "$PWD/bin/ovosctl" ~/.local/bin/ovosctl
 ```
 
@@ -100,8 +106,10 @@ service runs after its next restart.
 
 ```zsh
 brew install --cask swiftbar
-ln -sf "$PWD/swiftbar/ovos.5s.sh" "$(defaults read com.ameba.SwiftBar PluginDirectory)/ovos.5s.sh"
+ln -sf "$(brew --prefix)/share/ovos-mac-control/ovos.5s.sh" "$(defaults read com.ameba.SwiftBar PluginDirectory)/ovos.5s.sh"
 ```
+
+From a checkout, link `$PWD/swiftbar/ovos.5s.sh` instead.
 
 Point SwiftBar at a plugin folder on first launch; the command above links into
 whichever one you chose. The icon shows 🎙 when everything is up, `🎙 n/5` when
