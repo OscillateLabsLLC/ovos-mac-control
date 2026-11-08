@@ -1,0 +1,596 @@
+#!/bin/zsh
+#
+# ovosctl - a thin convenience layer over the ovos-installer launchd helper.
+#
+# ovos-installer ships ~/.config/ovos-installer/ovos-launchd.zsh, which defines
+# an `ovos` shell function that already handles enable/bootstrap/kickstart and
+# disable/bootout correctly. That file is the source of truth for which
+# services exist and how they are addressed, and the installer may overwrite
+# it, so this script sources it rather than duplicating its tables.
+#
+# What this adds on top: a single `toggle`, colourised at-a-glance status,
+# log rotation, and an exit code the menubar plugin can branch on.
+
+set -u
+setopt PIPE_FAIL
+
+readonly HELPER="$HOME/.config/ovos-installer/ovos-launchd.zsh"
+readonly LOG_DIR="$HOME/.local/state/mycroft/logs"
+readonly VENV_BIN="$HOME/.venvs/ovos/bin"
+
+readonly BOLD=$'\e[1m' GREEN=$'\e[32m' RED=$'\e[31m' YELLOW=$'\e[33m' DIM=$'\e[2m' RESET=$'\e[0m'
+
+die() {
+  print -u2 "ovosctl: $1"
+  exit 1
+}
+
+[[ -f $HELPER ]] || die "ovos-installer helper not found at $HELPER"
+source "$HELPER"
+
+# The browser GUI stack is not part of ovos-installer, so its LaunchAgents are
+# generated here. Registering them in the helper's label and plist maps makes
+# `ovos start <name>` and resolve_service work on them; leaving them OUT of
+# its service list keeps them running across `ovosctl stop`. They reconnect
+# when the messagebus comes back.
+readonly GUI_VENV="${OVOS_GUI_VENV:-$HOME/.venvs/ovos-gui}"
+readonly VISAGE_DIR="${OVOS_VISAGE_DIR:-$HOME/coding/OscillateLabs/ovos-visage}"
+readonly VISAGE_PORT=8766
+# Must stay in sync with GUI_SERVICES, gui_label and VISAGE_URL in the SwiftBar plugin.
+typeset -ra GUI_SERVICES=(ovos-gui ovos-homescreen ovos-visage)
+
+gui_label() { print "com.oscillatelabs.$1" }
+
+register_gui_services() {
+  local service label
+  for service in $GUI_SERVICES; do
+    label=$(gui_label "$service")
+    _OVOS_LAUNCHD_LABEL_BY_SERVICE[$service]=$label
+    _OVOS_LAUNCHD_PLIST_BY_SERVICE[$service]="$HOME/Library/LaunchAgents/$label.plist"
+  done
+}
+register_gui_services
+
+# Only the services this install actually has a plist for. The helper lists
+# every service ovos-installer knows about, including ones never installed.
+installed_services() {
+  local service
+  for service in "${_OVOS_LAUNCHD_USER_SERVICES[@]}"; do
+    [[ -f "${_OVOS_LAUNCHD_PLIST_BY_SERVICE[$service]}" ]] && print "$service"
+  done
+}
+
+installed_gui_services() {
+  local service
+  for service in $GUI_SERVICES; do
+    [[ -f "${_OVOS_LAUNCHD_PLIST_BY_SERVICE[$service]}" ]] && print "$service"
+  done
+}
+
+# Accepts a full service name (ovos-core) or a short one (core), plus the
+# historical aliases. Prints the canonical name; dies on anything unknown.
+resolve_service() {
+  local name=$1
+  case $name in
+    skills) name=ovos-core ;;
+    voice)  name=ovos-listener ;;
+  esac
+  [[ -n "${_OVOS_LAUNCHD_LABEL_BY_SERVICE[$name]:-}" ]] && { print "$name"; return 0 }
+  [[ -n "${_OVOS_LAUNCHD_LABEL_BY_SERVICE[ovos-$name]:-}" ]] && { print "ovos-$name"; return 0 }
+  die "unknown service '$1' (one of: ${(j: :)${(f)"$(installed_services; installed_gui_services)"}})"
+}
+
+service_state() {
+  local label="${_OVOS_LAUNCHD_LABEL_BY_SERVICE[$1]}" out
+  out=$(launchctl print "gui/$(id -u)/$label" 2>/dev/null) || { print stopped; return }
+  [[ $out == *"state = running"* ]] && print running || print loaded
+}
+
+service_pid() {
+  launchctl print "gui/$(id -u)/${_OVOS_LAUNCHD_LABEL_BY_SERVICE[$1]}" 2>/dev/null \
+    | awk '/^\tpid = /{print $3; exit}'
+}
+
+# --- log rotation -----------------------------------------------------------
+
+readonly LOG_MAX_BYTES=$((10 * 1024 * 1024))
+readonly LOG_GENERATIONS=3
+
+# NOTE: never name a local `path` in zsh - it is tied to `PATH`, so a plain
+# string assignment silently replaces the command search path.
+rotate_log() {
+  local log_path="$1" size i
+  [[ -f $log_path ]] || return 0
+  size=$(stat -f %z "$log_path") || return 0
+  (( size < LOG_MAX_BYTES )) && return 0
+
+  for (( i = LOG_GENERATIONS - 1; i >= 1; i-- )); do
+    [[ -f "$log_path.$i" ]] && mv -f "$log_path.$i" "$log_path.$((i + 1))"
+  done
+  mv -f "$log_path" "$log_path.1"
+  : > "$log_path"
+  return 0
+}
+
+# Rotating at start-time ties rotation to the one moment the files are
+# guaranteed not to be mid-write by a live service.
+rotate_all_logs() {
+  local f
+  for f in "$LOG_DIR"/*.log(N) "$LOG_DIR"/*.err(N); do
+    rotate_log "$f"
+  done
+  return 0
+}
+
+rotate_service_logs() {
+  rotate_log "$LOG_DIR/$1.log"
+  rotate_log "$LOG_DIR/$1.err"
+}
+
+# --- commands ---------------------------------------------------------------
+
+# With no argument these act on every installed service; with one, on just
+# that service.
+cmd_start() {
+  mkdir -p "$LOG_DIR"
+  if (( $# )); then
+    local service
+    service=$(resolve_service "$1") || exit 1
+    rotate_service_logs "$service"
+    ovos start "$service"
+    return
+  fi
+  rotate_all_logs
+  ovos start ovos
+}
+
+cmd_stop() {
+  local service
+  if (( $# )); then
+    service=$(resolve_service "$1") || exit 1
+    ovos stop "$service" || return
+    wait_until_stopped "$service"
+    return 0
+  fi
+  ovos stop ovos
+  for service in $(installed_services); do
+    wait_until_stopped "$service"
+  done
+  return 0
+}
+
+# ovos-core unloads its skills before exiting and can take ~15s, so `bootout`
+# returning is not the same as the process being gone.
+wait_until_stopped() {
+  local service="$1" i
+  for (( i = 0; i < 30; i++ )); do
+    [[ $(service_state "$service") == stopped ]] && return 0
+    sleep 1
+  done
+  return 0
+}
+
+cmd_restart() {
+  cmd_stop "$@"
+  cmd_start "$@"
+}
+
+print_service_status() {
+  local service=$1 state pid marker color
+  state=$(service_state "$service")
+  case $state in
+    running) marker="●"; color=$GREEN;  pid=$(service_pid "$service") ;;
+    loaded)  marker="◐"; color=$YELLOW; pid="" ;;
+    *)       marker="○"; color=$RED;    pid="" ;;
+  esac
+  printf "  %s%s%s %-22s %-8s %s\n" \
+    "$color" "$marker" "$RESET" "$service" "$state" "${pid:+pid $pid}"
+}
+
+cmd_status() {
+  local service
+  for service in $(installed_services); do
+    print_service_status "$service"
+  done
+  [[ -n $(installed_gui_services) ]] || return 0
+  print "${DIM}  gui${RESET}"
+  for service in $(installed_gui_services); do
+    print_service_status "$service"
+  done
+}
+
+# Exit 0 only when every installed service is running, so scripts and the
+# menubar plugin can ask "is OVOS up?" without parsing human-readable output.
+cmd_is_running() {
+  local service any=0
+  for service in $(installed_services); do
+    any=1
+    [[ $(service_state "$service") == running ]] || return 1
+  done
+  (( any )) || return 1
+  return 0
+}
+
+# True only when nothing is up. Distinct from `cmd_is_running`, which is true
+# only when everything is - a partially-up system satisfies neither.
+cmd_all_stopped() {
+  local service
+  for service in $(installed_services); do
+    [[ $(service_state "$service") == stopped ]] || return 1
+  done
+  return 0
+}
+
+cmd_toggle() {
+  if cmd_is_running; then
+    print "${BOLD}Stopping OVOS${RESET}"
+    cmd_stop
+  else
+    print "${BOLD}Starting OVOS${RESET}"
+    cmd_start
+  fi
+}
+
+# `core` is the skills service - its logger is literally named "skills", so
+# ovos-core.log is intent and skill traffic. Voice activity is in `listener`,
+# playback in `audio`, hardware plugins in `phal`. `all` tails every service
+# with the source prefixed, which is usually what you want when debugging.
+cmd_logs() {
+  local which=${1:-all} stream=${2:-log} file
+
+  if [[ $which == list ]]; then
+    local f
+    for f in "$LOG_DIR"/*.log(N) "$LOG_DIR"/*.err(N); do
+      printf "  %-34s %s\n" "${f:t}" "$(du -h "$f" | cut -f1)"
+    done
+    return 0
+  fi
+
+  if [[ $which == all ]]; then
+    local -a files=("$LOG_DIR"/*.$stream(N))
+    (( ${#files} )) || die "no .$stream files in $LOG_DIR"
+    # tail -f over several files prefixes each block with ==> name <==.
+    tail -f $files
+    return 0
+  fi
+
+  file=$(resolve_service "$which") || exit 1
+  [[ -f "$LOG_DIR/$file.$stream" ]] || die "no such log: $LOG_DIR/$file.$stream"
+  tail -f "$LOG_DIR/$file.$stream"
+}
+
+cmd_say() {
+  [[ -x "$VENV_BIN/ovos-say-to" ]] || die "ovos-say-to not found in $VENV_BIN"
+  "$VENV_BIN/ovos-say-to" "$@"
+}
+
+# --- upgrade ----------------------------------------------------------------
+
+readonly INSTALLER_REPO="https://github.com/OpenVoiceOS/ovos-installer.git"
+readonly INSTALLER_DIR="$HOME/ovos-installer"
+
+# The installer runs Ansible as root, which leaves root-owned files behind in
+# the checkout (.ansible/collections). Clearing that as the invoking user fails
+# noisily per-file, so escalate only when a plain removal is not enough.
+clear_installer_dir() {
+  [[ -e $INSTALLER_DIR ]] || return 0
+
+  rm -rf "$INSTALLER_DIR" 2>/dev/null
+  [[ -e $INSTALLER_DIR ]] || return 0
+
+  print "${DIM}Removing root-owned files from a previous run...${RESET}"
+  sudo rm -rf "$INSTALLER_DIR"
+  [[ -e $INSTALLER_DIR ]] && return 1
+  return 0
+}
+
+# The version of Python the OVOS venv is built on, as a bare `major.minor`.
+# The installer passes OVOS_VENV_PYTHON straight to Ansible, which asserts it
+# matches ^[0-9]+(\.[0-9]+)?$ - so a full interpreter path is rejected there.
+# Read it from the existing venv so an upgrade stays on the same Python.
+installer_python_version() {
+  local cfg="$HOME/.venvs/ovos/pyvenv.cfg" version
+
+  if [[ -f $cfg ]]; then
+    version=$(awk -F' = ' '/^version_info = /{print $2; exit}' "$cfg")
+    [[ -z $version ]] && version=$(awk -F' = ' '/^version = /{print $2; exit}' "$cfg")
+    if [[ $version =~ '^([0-9]+\.[0-9]+)' ]]; then
+      print "$match[1]"; return 0
+    fi
+  fi
+
+  return 1
+}
+
+# The upstream one-liner (installer.sh) always clones main and takes no
+# arguments, so branch testing is done by cloning the branch here and invoking
+# setup.sh directly - which is exactly what installer.sh does after cloning.
+cmd_upgrade() {
+  local branch=main keep_checkout=0
+  while (( $# )); do
+    case $1 in
+      -b|--branch) shift; [[ $# -gt 0 ]] || die "--branch needs a branch name"; branch=$1 ;;
+      -k|--keep)   keep_checkout=1 ;;
+      -h|--help)   print "Usage: ovosctl upgrade [--branch NAME] [--keep]"; return 0 ;;
+      *)           die "unknown upgrade option '$1'" ;;
+    esac
+    shift
+  done
+
+  command -v git >/dev/null || die "git is required"
+
+  # setup.sh needs bash >= 4; macOS ships bash 3.2 at /bin/bash.
+  local bash_bin
+  bash_bin=$(command -v bash)
+  if [[ -z $bash_bin ]] || [[ $("$bash_bin" -c 'echo ${BASH_VERSINFO[0]}') -lt 4 ]]; then
+    [[ -x /opt/homebrew/bin/bash ]] && bash_bin=/opt/homebrew/bin/bash \
+      || die "bash >= 4 required; install it with: brew install bash"
+  fi
+
+  # Pin the upgrade to the Python the current OVOS venv already uses, so a
+  # newer default interpreter on the host cannot silently rebuild it.
+  local venv_python
+  venv_python=$(installer_python_version) || venv_python=""
+  [[ -n $venv_python ]] && print "${DIM}Installer Python: $venv_python${RESET}"
+
+  print "${BOLD}Upgrading OVOS${RESET} (branch: ${YELLOW}$branch${RESET})"
+
+  # The installer draws an interactive TUI and prompts for a sudo password, so
+  # it needs the real terminal. Refuse rather than hang if there isn't one, and
+  # prime the sudo timestamp first so the password prompt is not competing with
+  # the TUI for the screen.
+  [[ -t 0 && -t 1 ]] || die "upgrade is interactive; run it directly in a terminal"
+
+  print "${DIM}Requesting sudo (the installer needs it)...${RESET}"
+  sudo -v || die "sudo authentication failed"
+
+  # Everything that can fail happens before the services are stopped, so a
+  # failed clone never leaves OVOS down.
+  clear_installer_dir || die "could not clear $INSTALLER_DIR"
+
+  print "${DIM}Cloning $branch...${RESET}"
+  git clone --quiet --branch "$branch" --depth 1 "$INSTALLER_REPO" "$INSTALLER_DIR" \
+    || die "failed to clone branch '$branch'"
+
+  # The installer manages the services itself, but stopping first avoids
+  # upgrading packages out from under running processes.
+  if ! cmd_all_stopped; then
+    print "\n${DIM}Stopping services before upgrade...${RESET}"
+    cmd_stop
+  fi
+
+  print "${DIM}Running installer...${RESET}\n"
+  local rc=0
+  cd "$INSTALLER_DIR" || die "cannot enter $INSTALLER_DIR"
+  # A clean PATH keeps the installer off any virtualenv interpreters that are
+  # earlier on the interactive PATH; OVOS_VENV_PYTHON pins the one to build on.
+  local -a installer_env=(
+    RUN_AS="$USER"
+    RUN_AS_HOME="$HOME"
+    PATH="/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+  )
+  [[ -n $venv_python ]] && installer_env+=(OVOS_VENV_PYTHON="$venv_python")
+  env $installer_env sudo -E "$bash_bin" setup.sh || rc=$?
+  cd "$HOME" || true
+
+  if (( rc != 0 )); then
+    print "\n${RED}Installer exited with status $rc${RESET}"
+    print "${DIM}Checkout kept for inspection: $INSTALLER_DIR${RESET}"
+    print "${DIM}Installer log: /var/log/ovos-installer.log${RESET}"
+    print "${DIM}Services are stopped; run 'ovosctl start' when you need them.${RESET}"
+    return $rc
+  fi
+
+  if (( keep_checkout )); then
+    print "\n${DIM}Checkout kept at $INSTALLER_DIR${RESET}"
+  else
+    clear_installer_dir
+  fi
+
+  print "\n${GREEN}Upgrade complete.${RESET}"
+  if [[ -f "$HOME/.config/mycroft/mycroft.conf.overlay.json" ]]; then
+    print "${DIM}Restoring hand-maintained config sections...${RESET}"
+    cmd_conf apply || print "${YELLOW}Overlay merge failed; run 'ovosctl conf apply' by hand.${RESET}"
+  fi
+  print "${DIM}Services are stopped; run 'ovosctl start' to test.${RESET}"
+  return 0
+}
+
+# --- conf -------------------------------------------------------------------
+
+# The installer rewrites mycroft.conf from its wizard answers, so hand-added
+# sections live in mycroft.conf.overlay.json and ovos-conf-merge puts them
+# back. The tool sits beside this script in the repo.
+readonly CONF_MERGE="${0:A:h}/ovos-conf-merge"
+
+cmd_conf() {
+  [[ -x $CONF_MERGE ]] || die "ovos-conf-merge not found beside ovosctl"
+  "$CONF_MERGE" "${1:-check}" "${@:2}"
+}
+
+# --- gui --------------------------------------------------------------------
+
+gui_venv_for() {
+  [[ $1 == ovos-visage ]] && print "$VISAGE_DIR/.venv" || print "$GUI_VENV"
+}
+
+# One argument per line; the first is the executable.
+gui_program_args() {
+  case $1 in
+    ovos-gui)        print -l "$GUI_VENV/bin/ovos-gui-service" ;;
+    ovos-homescreen) print -l "$GUI_VENV/bin/ovos-skill-launcher" ovos-skill-homescreen.openvoiceos ;;
+    ovos-visage)     print -l "$VISAGE_DIR/.venv/bin/ovos-visage" --http-port "$VISAGE_PORT" ;;
+  esac
+}
+
+# Same shape as the plists ovos-installer writes, so the GUI behaves like the
+# rest of OVOS: restart on a crash, stay down after a clean exit, log to LOG_DIR.
+write_gui_plist() {
+  local service=$1 venv args="" arg
+  venv=$(gui_venv_for "$service")
+  for arg in "${(@f)$(gui_program_args "$service")}"; do
+    args+="      <string>$arg</string>"$'\n'
+  done
+  cat > "${_OVOS_LAUNCHD_PLIST_BY_SERVICE[$service]}" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>Label</key>
+    <string>$(gui_label "$service")</string>
+    <key>ProgramArguments</key>
+    <array>
+${args}    </array>
+    <key>WorkingDirectory</key>
+    <string>$venv</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+      <key>HOME</key>
+      <string>$HOME</string>
+      <key>PATH</key>
+      <string>$venv/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+      <key>VIRTUAL_ENV</key>
+      <string>$venv</string>
+      <key>XDG_CONFIG_HOME</key>
+      <string>$HOME/.config</string>
+      <key>XDG_CACHE_HOME</key>
+      <string>$HOME/.cache</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+      <key>SuccessfulExit</key>
+      <false/>
+    </dict>
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+    <key>StandardOutPath</key>
+    <string>$LOG_DIR/$service.log</string>
+    <key>StandardErrorPath</key>
+    <string>$LOG_DIR/$service.err</string>
+  </dict>
+</plist>
+EOF
+}
+
+gui_check_binaries() {
+  local service bin
+  for service in $GUI_SERVICES; do
+    bin=${${(f)"$(gui_program_args "$service")"}[1]}
+    [[ -x $bin ]] || die "$service: $bin not found (set OVOS_GUI_VENV or OVOS_VISAGE_DIR)"
+  done
+}
+
+# Re-running install rewrites the plists and restarts, which is how a changed
+# path or argument reaches launchd: a loaded job keeps its old definition.
+gui_install() {
+  local service plist
+  gui_check_binaries
+  mkdir -p "$LOG_DIR" "$HOME/Library/LaunchAgents"
+  for service in $GUI_SERVICES; do
+    plist="${_OVOS_LAUNCHD_PLIST_BY_SERVICE[$service]}"
+    write_gui_plist "$service"
+    plutil -lint -s "$plist" || die "generated an invalid plist: $plist"
+    print "wrote $plist"
+  done
+  gui_each restart
+}
+
+gui_uninstall() {
+  local service
+  for service in $(installed_gui_services); do
+    cmd_stop "$service"
+    rm -f "${_OVOS_LAUNCHD_PLIST_BY_SERVICE[$service]}"
+  done
+}
+
+gui_each() {
+  local action=$1 service
+  for service in $GUI_SERVICES; do
+    "cmd_$action" "$service" || return
+  done
+}
+
+cmd_gui() {
+  local action=${1:-status} service
+  case $action in
+    install)            gui_install ;;
+    uninstall)          gui_uninstall ;;
+    start|stop|restart) gui_each "$action" ;;
+    open)               open "http://127.0.0.1:$VISAGE_PORT" ;;
+    status)
+      for service in $(installed_gui_services); do
+        print_service_status "$service"
+      done ;;
+    *) die "usage: ovosctl gui [status|install|uninstall|start|stop|restart|open]" ;;
+  esac
+}
+
+cmd_cli() {
+  [[ -x "$VENV_BIN/ovos-simple-cli" ]] || die "ovos-simple-cli not found in $VENV_BIN"
+  "$VENV_BIN/ovos-simple-cli" "$@"
+}
+
+usage() {
+  cat <<'EOF'
+ovosctl - start, stop and inspect OVOS on macOS
+
+Usage: ovosctl <command> [args]
+
+  start [service] Start every installed service, or just one (rotates logs first)
+  stop [service]  Stop every installed service, or just one, waiting for full shutdown
+  restart [service]
+                  Stop, then start
+  toggle          Start if down, stop if up
+  status          Per-service state and pid
+  is-running      Exit 0 if every service is running (for scripts)
+  logs [what] [log|err]
+                  Tail logs. Default `all` tails every service at once.
+                  Names: core (skills/intents), listener (voice), audio,
+                  phal, messagebus, or any full service name like
+                  ovos-core. `logs list` shows the files and sizes.
+  say <text>      Speak text through OVOS
+  cli             Open the OVOS text client
+  upgrade [--branch NAME] [--keep]
+                  Re-run the ovos-installer (needs sudo, interactive), then
+                  merge mycroft.conf.overlay.json back into mycroft.conf.
+                  --branch tests an installer branch instead of main;
+                  --keep leaves the checkout in ~/ovos-installer.
+  conf [check|apply|diff]
+                  Hand-maintained mycroft.conf sections live in
+                  ~/.config/mycroft/mycroft.conf.overlay.json. `check` (the
+                  default) reports drift, `apply` merges them back.
+  gui [status|install|uninstall|start|stop|restart|open]
+                  The browser GUI: ovos-gui, ovos-homescreen, ovos-visage.
+                  `install` writes their LaunchAgents and starts them. They
+                  are separate from OVOS: `ovosctl stop` leaves them running.
+                  Each one also takes start/stop/restart/logs by name.
+
+Stop persists across reboots: OVOS stays off until `ovosctl start`.
+EOF
+}
+
+main() {
+  local cmd=${1:-status}
+  (( $# > 0 )) && shift
+
+  case $cmd in
+    start)          print "${BOLD}Starting ${1:-OVOS}${RESET}"; cmd_start "$@" ;;
+    stop)           print "${BOLD}Stopping ${1:-OVOS}${RESET}"; cmd_stop "$@" ;;
+    restart)        print "${BOLD}Restarting ${1:-OVOS}${RESET}"; cmd_restart "$@" ;;
+    toggle)         cmd_toggle ;;
+    status|st)      cmd_status ;;
+    is-running)     cmd_is_running ;;
+    logs|log)       cmd_logs "$@" ;;
+    say)            cmd_say "$@" ;;
+    cli)            cmd_cli "$@" ;;
+    upgrade|update) cmd_upgrade "$@" ;;
+    conf|config)    cmd_conf "$@" ;;
+    gui)            cmd_gui "$@" ;;
+    -h|--help|help) usage ;;
+    *)              print -u2 "ovosctl: unknown command '$cmd'"; usage; exit 1 ;;
+  esac
+}
+
+main "$@"
