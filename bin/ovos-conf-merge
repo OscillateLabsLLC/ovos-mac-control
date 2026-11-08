@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+"""Keep hand-written sections of mycroft.conf alive across ovos-installer runs.
+
+The installer rewrites ~/.config/mycroft/mycroft.conf from its wizard answers,
+dropping anything added by hand (PHAL plugin entries, g2p, TTS choices...).
+Those sections live in an overlay file instead, and this tool deep-merges the
+overlay into the installer's file: `check` says whether the live config has
+drifted from the overlay, `apply` merges it back (with a backup).
+
+    ovos-conf-merge check              exit 0 if merged, 1 if drifted
+    ovos-conf-merge apply              merge the overlay in, backing up first
+    ovos-conf-merge diff               print the paths that differ
+    ovos-conf-merge --conf PATH ...    operate on another file (for testing)
+
+Dicts merge recursively; any other value in the overlay (lists included)
+replaces the installer's value wholesale.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import sys
+from datetime import datetime
+from pathlib import Path
+
+CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "mycroft"
+DEFAULT_CONF = CONFIG_DIR / "mycroft.conf"
+DEFAULT_OVERLAY = CONFIG_DIR / "mycroft.conf.overlay.json"
+BACKUP_STAMP = "%Y%m%d-%H%M%S"
+
+
+def load_json(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text())
+    except FileNotFoundError:
+        sys.exit(f"ovos-conf-merge: {path} does not exist")
+    except json.JSONDecodeError as err:
+        sys.exit(f"ovos-conf-merge: {path} is not valid JSON: {err}")
+    if not isinstance(data, dict):
+        sys.exit(f"ovos-conf-merge: {path} must contain a JSON object")
+    return data
+
+
+def deep_merge(base: dict, overlay: dict) -> dict:
+    merged = dict(base)
+    for key, value in overlay.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def drifted_paths(conf: dict, overlay: dict, prefix: str = "") -> list[str]:
+    """Overlay paths whose value is missing from, or different in, the live config."""
+    paths = []
+    for key, value in overlay.items():
+        path = f"{prefix}{key}"
+        current = conf.get(key)
+        if isinstance(value, dict) and isinstance(current, dict):
+            paths.extend(drifted_paths(current, value, path + "."))
+        elif current != value:
+            paths.append(path)
+    return paths
+
+
+def backup(conf_path: Path) -> Path:
+    stamp = datetime.now().strftime(BACKUP_STAMP)
+    target = conf_path.with_name(f"{conf_path.name}.pre-overlay.{stamp}")
+    shutil.copy2(conf_path, target)
+    return target
+
+
+def write_json(path: Path, data: dict) -> None:
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(data, indent=4, sort_keys=True) + "\n")
+    shutil.copymode(path, tmp)
+    tmp.replace(path)
+
+
+def cmd_check(conf_path: Path, overlay_path: Path) -> int:
+    drift = drifted_paths(load_json(conf_path), load_json(overlay_path))
+    if not drift:
+        print(f"{conf_path.name}: overlay is fully applied")
+        return 0
+    print(f"{conf_path.name}: {len(drift)} overlay path(s) missing or changed")
+    for path in drift:
+        print(f"  - {path}")
+    print(f"run `ovos-conf-merge apply` (or `ovosctl conf apply`) to restore them")
+    return 1
+
+
+def cmd_diff(conf_path: Path, overlay_path: Path) -> int:
+    conf, overlay = load_json(conf_path), load_json(overlay_path)
+    drift = drifted_paths(conf, overlay)
+    for path in drift:
+        live = conf
+        for part in path.split("."):
+            live = live.get(part) if isinstance(live, dict) else None
+        wanted = overlay
+        for part in path.split("."):
+            wanted = wanted[part]
+        print(f"{path}\n  live:    {json.dumps(live)}\n  overlay: {json.dumps(wanted)}")
+    return 1 if drift else 0
+
+
+def cmd_apply(conf_path: Path, overlay_path: Path) -> int:
+    conf, overlay = load_json(conf_path), load_json(overlay_path)
+    drift = drifted_paths(conf, overlay)
+    if not drift:
+        print(f"{conf_path.name}: nothing to do, overlay already applied")
+        return 0
+    saved = backup(conf_path)
+    write_json(conf_path, deep_merge(conf, overlay))
+    print(f"{conf_path.name}: restored {len(drift)} path(s); backup at {saved.name}")
+    for path in drift:
+        print(f"  + {path}")
+    print("restart the affected services for the change to take effect")
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="ovos-conf-merge", description=__doc__.split("\n\n")[0])
+    parser.add_argument("command", choices=("check", "apply", "diff"))
+    parser.add_argument("--conf", type=Path, default=DEFAULT_CONF, help=f"config to operate on (default {DEFAULT_CONF})")
+    parser.add_argument("--overlay", type=Path, default=DEFAULT_OVERLAY, help=f"overlay file (default {DEFAULT_OVERLAY})")
+    args = parser.parse_args(argv)
+    handler = {"check": cmd_check, "apply": cmd_apply, "diff": cmd_diff}[args.command]
+    return handler(args.conf, args.overlay)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
