@@ -39,6 +39,8 @@ readonly GUI_VENV="${OVOS_GUI_VENV:-$HOME/.venvs/ovos-gui}"
 readonly VISAGE_APP="${OVOS_VISAGE_APP:-/Applications/OVOS Visage.app}"
 readonly VISAGE_DIR="${OVOS_VISAGE_DIR:-}"
 readonly VISAGE_PORT=8766
+# ovos-gui's default GUI websocket port, the one Visage connects to.
+readonly GUI_PORT="${OVOS_GUI_PORT:-18181}"
 # Must stay in sync with GUI_SERVICES and gui_label in the SwiftBar plugin.
 typeset -ra GUI_SERVICES=(ovos-gui ovos-homescreen ovos-visage ovos-visage-app)
 
@@ -533,9 +535,23 @@ pip_install_into() {
 }
 
 # Only when missing: a working GUI venv is left exactly as it is.
+# ovos-gui 1.6.0a1 imports OVOSGUIAdapterFactory, which no released
+# ovos-plugin-manager has yet (OpenVoiceOS/ovos-plugin-manager#377), so it
+# crashes on start. Stay on the 1.5 line until that ships.
 gui_ensure_venv() {
   [[ -x $GUI_VENV/bin/ovos-gui-service && -x $GUI_VENV/bin/ovos-skill-launcher ]] && return 0
-  pip_install_into "$GUI_VENV" --pre ovos-gui ovos-workshop ovos-skill-homescreen
+  pip_install_into "$GUI_VENV" --pre "ovos-gui<1.6" ovos-workshop ovos-skill-homescreen
+}
+
+# "started" only means launchd took the job; a service that crashes on import
+# still says that. Wait for the GUI socket Visage connects to.
+gui_verify_listening() {
+  local attempt
+  for attempt in {1..30}; do
+    lsof -nP -iTCP:"$GUI_PORT" -sTCP:LISTEN >/dev/null 2>&1 && return 0
+    sleep 0.5
+  done
+  die "ovos-gui is not listening on port $GUI_PORT; see 'ovosctl logs gui err'"
 }
 
 gui_check_binaries() {
@@ -569,6 +585,7 @@ gui_install() {
     install_plist "$service"
   done
   gui_each restart
+  gui_verify_listening
 }
 
 install_plist() {
