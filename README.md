@@ -84,7 +84,10 @@ for a full shutdown, for one service or all of them, and accepts short names
 
 ## GUI (always on)
 
-`ovosctl gui install` writes LaunchAgents for the GUI stack and starts it:
+`ovosctl gui install` writes LaunchAgents for the GUI stack and starts it. If
+`~/.venvs/ovos-gui` doesn't exist yet, it creates it first, on the OVOS venv's
+Python, and installs `ovos-gui`, `ovos-workshop` and `ovos-skill-homescreen`
+into it. An existing venv is left as it is.
 
 | service           | runs                                                               |
 |-------------------|--------------------------------------------------------------------|
@@ -115,6 +118,22 @@ group with `ovosctl gui start|stop|restart|status|open`, or one at a time by
 name (`ovosctl restart visage-app`, `ovosctl logs gui err`). Re-run `install`
 after changing a path; a loaded launchd job keeps its old definition. If you
 quit the app, it stays closed until `ovosctl gui start`.
+
+## Skill Settings
+
+```zsh
+ovosctl settings install
+```
+
+This installs [ovos-skill-config-tool](https://github.com/OscillateLabsLLC/ovos-skill-config-tool)
+into `~/.venvs/ovos-config` and runs it as a LaunchAgent, so every skill's
+settings are a browser tab away: `ovosctl settings open`, or **Skill
+Settings…** in the menubar. The login defaults to `ovos` / `ovos`.
+
+It only listens on `127.0.0.1`, so nothing else on your network can reach it.
+Skill settings hold secrets like API tokens. After starting it, `install`
+checks the address it is actually listening on, and stops it with an error if
+that's anything else. Set `OVOS_SETTINGS_PORT` to use a port other than 8000.
 
 ## Menubar switch (SwiftBar)
 

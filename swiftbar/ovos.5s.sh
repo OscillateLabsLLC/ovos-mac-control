@@ -34,8 +34,9 @@ readonly OVOS_ICON="iVBORw0KGgoAAAANSUhEUgAAACQAAAAkCAYAAADhAJiYAAAACXBIWXMAABYl
 
 # Must stay in sync with GUI_SERVICES and gui_label in ovosctl.
 typeset -ra GUI_SERVICES=(ovos-gui ovos-homescreen ovos-visage ovos-visage-app)
+readonly SETTINGS_SERVICE=ovos-settings
 
-for service in $GUI_SERVICES; do
+for service in $GUI_SERVICES $SETTINGS_SERVICE; do
   _OVOS_LAUNCHD_LABEL_BY_SERVICE[$service]="com.oscillatelabs.$service"
   _OVOS_LAUNCHD_PLIST_BY_SERVICE[$service]="$HOME/Library/LaunchAgents/com.oscillatelabs.$service.plist"
 done
@@ -162,6 +163,16 @@ print_gui_actions() {
   fi
 }
 
+print_settings_item() {
+  [[ -f "${_OVOS_LAUNCHD_PLIST_BY_SERVICE[$SETTINGS_SERVICE]}" ]] || return 0
+  print -- "---"
+  if service_is_running "$SETTINGS_SERVICE"; then
+    ovosctl_item "Skill Settings…" settings open
+  else
+    ovosctl_item "Start Skill Settings" settings start
+  fi
+}
+
 collect_state
 print_title
 print -- "---"
@@ -177,6 +188,7 @@ if (( ${#gui_installed} )); then
     print_service_menu "$service"
   done
 fi
+print_settings_item
 print -- "---"
 print "Logs folder | bash=/usr/bin/open param1=$LOG_DIR terminal=false"
 print "Refresh | refresh=true"

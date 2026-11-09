@@ -55,9 +55,18 @@ wanted_gui_services() {
   fi
 }
 
+# Skill Settings is ovos-skill-config-tool, run the same way as the GUI. It
+# only listens on 127.0.0.1: skill settings hold secrets such as API tokens.
+readonly SETTINGS_SERVICE=ovos-settings
+readonly SETTINGS_VENV="${OVOS_SETTINGS_VENV:-$HOME/.venvs/ovos-config}"
+readonly SETTINGS_PORT="${OVOS_SETTINGS_PORT:-8000}"
+# 1.1.0 is the first release that honours CONFIG_HOST; older ones listen on
+# every interface whatever it says.
+readonly SETTINGS_PACKAGE="${OVOS_SETTINGS_PACKAGE:-ovos-skill-config-tool>=1.1.0}"
+
 register_gui_services() {
   local service label
-  for service in $GUI_SERVICES; do
+  for service in $GUI_SERVICES $SETTINGS_SERVICE; do
     label=$(gui_label "$service")
     _OVOS_LAUNCHD_LABEL_BY_SERVICE[$service]=$label
     _OVOS_LAUNCHD_PLIST_BY_SERVICE[$service]="$HOME/Library/LaunchAgents/$label.plist"
@@ -206,11 +215,15 @@ cmd_status() {
   for service in $(installed_services); do
     print_service_status "$service"
   done
-  [[ -n $(installed_gui_services) ]] || return 0
-  print "${DIM}  gui${RESET}"
-  for service in $(installed_gui_services); do
-    print_service_status "$service"
-  done
+  if [[ -n $(installed_gui_services) ]]; then
+    print "${DIM}  gui${RESET}"
+    for service in $(installed_gui_services); do
+      print_service_status "$service"
+    done
+  fi
+  settings_installed || return 0
+  print "${DIM}  skill settings${RESET}"
+  print_service_status "$SETTINGS_SERVICE"
 }
 
 # Exit 0 only when every installed service is running, so scripts and the
@@ -425,7 +438,20 @@ cmd_conf() {
 # --- gui --------------------------------------------------------------------
 
 gui_venv_for() {
-  [[ $1 == ovos-visage ]] && print "$VISAGE_DIR/.venv" || print "$GUI_VENV"
+  case $1 in
+    ovos-visage)        print "$VISAGE_DIR/.venv" ;;
+    $SETTINGS_SERVICE)  print "$SETTINGS_VENV" ;;
+    *)                  print "$GUI_VENV" ;;
+  esac
+}
+
+# Plist <key>/<string> lines for settings only one service needs.
+gui_extra_env() {
+  [[ $1 == $SETTINGS_SERVICE ]] || return 0
+  print "      <key>CONFIG_HOST</key>"
+  print "      <string>127.0.0.1</string>"
+  print "      <key>CONFIG_PORT</key>"
+  print "      <string>$SETTINGS_PORT</string>"
 }
 
 # One argument per line; the first is the executable.
@@ -435,6 +461,7 @@ gui_program_args() {
     ovos-homescreen) print -l "$GUI_VENV/bin/ovos-skill-launcher" ovos-skill-homescreen.openvoiceos ;;
     ovos-visage)     print -l "$VISAGE_DIR/.venv/bin/ovos-visage" --http-port "$VISAGE_PORT" ;;
     ovos-visage-app) print -l "$VISAGE_APP/Contents/MacOS/$(defaults read "$VISAGE_APP/Contents/Info" CFBundleExecutable)" ;;
+    $SETTINGS_SERVICE) print -l "$SETTINGS_VENV/bin/ovos-skill-config-tool" ;;
   esac
 }
 
@@ -470,6 +497,7 @@ ${args}    </array>
       <string>$HOME/.config</string>
       <key>XDG_CACHE_HOME</key>
       <string>$HOME/.cache</string>
+$(gui_extra_env "$service")
     </dict>
     <key>RunAtLoad</key>
     <true/>
@@ -487,6 +515,27 @@ ${args}    </array>
   </dict>
 </plist>
 EOF
+}
+
+# Helper venvs are built on the OVOS venv's own Python, a version the installer
+# already chose, never macOS's older system python3. env -u clears the
+# constraints an OVOS alpha install exports, which stop pip resolving these.
+pip_install_into() {
+  local venv=$1; shift
+  if [[ ! -x $venv/bin/python ]]; then
+    [[ -x $VENV_BIN/python ]] || die "the OVOS venv is missing ($VENV_BIN); run ovos-installer first"
+    print "creating $venv"
+    "$VENV_BIN/python" -m venv "$venv" || die "could not create $venv"
+  fi
+  print "installing $* into $venv"
+  env -u VIRTUAL_ENV -u PIP_CONSTRAINT -u UV_CONSTRAINT \
+    "$venv/bin/pip" install --quiet --disable-pip-version-check "$@" || die "pip install failed in $venv"
+}
+
+# Only when missing: a working GUI venv is left exactly as it is.
+gui_ensure_venv() {
+  [[ -x $GUI_VENV/bin/ovos-gui-service && -x $GUI_VENV/bin/ovos-skill-launcher ]] && return 0
+  pip_install_into "$GUI_VENV" --pre ovos-gui ovos-workshop ovos-skill-homescreen
 }
 
 gui_check_binaries() {
@@ -512,17 +561,22 @@ gui_remove_unwanted() {
 # Re-running install rewrites the plists and restarts, which is how a changed
 # path or argument reaches launchd: a loaded job keeps its old definition.
 gui_install() {
-  local service plist
+  local service
+  gui_ensure_venv
   gui_check_binaries
   gui_remove_unwanted
-  mkdir -p "$LOG_DIR" "$HOME/Library/LaunchAgents"
   for service in $(wanted_gui_services); do
-    plist="${_OVOS_LAUNCHD_PLIST_BY_SERVICE[$service]}"
-    write_gui_plist "$service"
-    plutil -lint -s "$plist" || die "generated an invalid plist: $plist"
-    print "wrote $plist"
+    install_plist "$service"
   done
   gui_each restart
+}
+
+install_plist() {
+  local plist="${_OVOS_LAUNCHD_PLIST_BY_SERVICE[$1]}"
+  mkdir -p "$LOG_DIR" "$HOME/Library/LaunchAgents"
+  write_gui_plist "$1"
+  plutil -lint -s "$plist" || die "generated an invalid plist: $plist"
+  print "wrote $plist"
 }
 
 gui_open() {
@@ -566,6 +620,61 @@ cmd_gui() {
   esac
 }
 
+# --- skill settings ---------------------------------------------------------
+
+settings_installed() { [[ -f ${_OVOS_LAUNCHD_PLIST_BY_SERVICE[$SETTINGS_SERVICE]} ]] }
+
+# The listening address, e.g. 127.0.0.1:8000 or *:8000, once the tool is up.
+settings_listen_address() {
+  local attempt
+  for attempt in {1..20}; do
+    lsof -nP -a -p "$(service_pid "$SETTINGS_SERVICE")" -iTCP:"$SETTINGS_PORT" -sTCP:LISTEN -Fn 2>/dev/null \
+      | awk '/^n/ { print substr($0, 2); exit }' | grep . && return 0
+    sleep 0.5
+  done
+  return 1
+}
+
+# Fail loud rather than leave skill secrets reachable from the network.
+settings_verify_local_only() {
+  local address
+  address=$(settings_listen_address) \
+    || die "Skill Settings did not start; see 'ovosctl logs settings err'"
+  if [[ $address != 127.0.0.1:* ]]; then
+    cmd_stop "$SETTINGS_SERVICE"
+    die "Skill Settings listened on $address, not 127.0.0.1; stopped it (needs $SETTINGS_PACKAGE)"
+  fi
+  print "Skill Settings is at http://$address"
+}
+
+settings_install() {
+  # Always run: pip upgrades an older ovos-skill-config-tool to the minimum.
+  pip_install_into "$SETTINGS_VENV" "$SETTINGS_PACKAGE"
+  install_plist "$SETTINGS_SERVICE"
+  cmd_restart "$SETTINGS_SERVICE"
+  settings_verify_local_only
+}
+
+settings_uninstall() {
+  settings_installed || return 0
+  cmd_stop "$SETTINGS_SERVICE"
+  rm -f "${_OVOS_LAUNCHD_PLIST_BY_SERVICE[$SETTINGS_SERVICE]}"
+  print "removed $SETTINGS_SERVICE (its venv, $SETTINGS_VENV, is kept)"
+}
+
+cmd_settings() {
+  local action=${1:-status}
+  [[ $action == install ]] || settings_installed || die "Skill Settings is not installed (run 'ovosctl settings install')"
+  case $action in
+    install)            settings_install ;;
+    uninstall)          settings_uninstall ;;
+    start|stop|restart) "cmd_$action" "$SETTINGS_SERVICE" ;;
+    open)               open "http://127.0.0.1:$SETTINGS_PORT" ;;
+    status)             print_service_status "$SETTINGS_SERVICE" ;;
+    *) die "usage: ovosctl settings [status|install|uninstall|start|stop|restart|open]" ;;
+  esac
+}
+
 cmd_cli() {
   [[ -x "$VENV_BIN/ovos-simple-cli" ]] || die "ovos-simple-cli not found in $VENV_BIN"
   "$VENV_BIN/ovos-simple-cli" "$@"
@@ -604,9 +713,14 @@ Usage: ovosctl <command> [args]
                   The GUI: ovos-gui, ovos-homescreen, and Visage, either the
                   native app (ovos-visage-app) or, with OVOS_VISAGE_DIR set,
                   the browser server (ovos-visage).
-                  `install` writes their LaunchAgents and starts them. They
-                  are separate from OVOS: `ovosctl stop` leaves them running.
+                  `install` creates ~/.venvs/ovos-gui if it is missing, writes
+                  their LaunchAgents and starts them. They are separate from
+                  OVOS: `ovosctl stop` leaves them running.
                   Each one also takes start/stop/restart/logs by name.
+  settings [status|install|uninstall|start|stop|restart|open]
+                  Skill Settings (ovos-skill-config-tool) in a browser.
+                  `install` puts it in ~/.venvs/ovos-config and runs it as a
+                  LaunchAgent on http://127.0.0.1:8000, local to this Mac.
 
 Stop persists across reboots: OVOS stays off until `ovosctl start`.
 EOF
@@ -629,6 +743,7 @@ main() {
     upgrade|update) cmd_upgrade "$@" ;;
     conf|config)    cmd_conf "$@" ;;
     gui)            cmd_gui "$@" ;;
+    settings)       cmd_settings "$@" ;;
     -h|--help|help) usage ;;
     *)              print -u2 "ovosctl: unknown command '$cmd'"; usage; exit 1 ;;
   esac
