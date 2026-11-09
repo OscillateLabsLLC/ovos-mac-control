@@ -34,12 +34,26 @@ source "$HELPER"
 # its service list keeps them running across `ovosctl stop`. They reconnect
 # when the messagebus comes back.
 readonly GUI_VENV="${OVOS_GUI_VENV:-$HOME/.venvs/ovos-gui}"
-readonly VISAGE_DIR="${OVOS_VISAGE_DIR:-$HOME/coding/OscillateLabs/ovos-visage}"
+# Visage is either the native app (the ovos-gui-visage cask) or the browser
+# server from an ovos-visage checkout. Setting OVOS_VISAGE_DIR picks the browser.
+readonly VISAGE_APP="${OVOS_VISAGE_APP:-/Applications/OVOS Visage.app}"
+readonly VISAGE_DIR="${OVOS_VISAGE_DIR:-}"
 readonly VISAGE_PORT=8766
-# Must stay in sync with GUI_SERVICES, gui_label and VISAGE_URL in the SwiftBar plugin.
-typeset -ra GUI_SERVICES=(ovos-gui ovos-homescreen ovos-visage)
+# Must stay in sync with GUI_SERVICES and gui_label in the SwiftBar plugin.
+typeset -ra GUI_SERVICES=(ovos-gui ovos-homescreen ovos-visage ovos-visage-app)
 
 gui_label() { print "com.oscillatelabs.$1" }
+
+# The services `gui install` sets up: the GUI service, the homescreen, and one
+# Visage, or none if neither kind is available.
+wanted_gui_services() {
+  print -l ovos-gui ovos-homescreen
+  if [[ -n $VISAGE_DIR ]]; then
+    print ovos-visage
+  elif [[ -d $VISAGE_APP ]]; then
+    print ovos-visage-app
+  fi
+}
 
 register_gui_services() {
   local service label
@@ -420,6 +434,7 @@ gui_program_args() {
     ovos-gui)        print -l "$GUI_VENV/bin/ovos-gui-service" ;;
     ovos-homescreen) print -l "$GUI_VENV/bin/ovos-skill-launcher" ovos-skill-homescreen.openvoiceos ;;
     ovos-visage)     print -l "$VISAGE_DIR/.venv/bin/ovos-visage" --http-port "$VISAGE_PORT" ;;
+    ovos-visage-app) print -l "$VISAGE_APP/Contents/MacOS/$(defaults read "$VISAGE_APP/Contents/Info" CFBundleExecutable)" ;;
   esac
 }
 
@@ -476,9 +491,21 @@ EOF
 
 gui_check_binaries() {
   local service bin
-  for service in $GUI_SERVICES; do
+  for service in $(wanted_gui_services); do
     bin=${${(f)"$(gui_program_args "$service")"}[1]}
-    [[ -x $bin ]] || die "$service: $bin not found (set OVOS_GUI_VENV or OVOS_VISAGE_DIR)"
+    [[ -x $bin ]] || die "$service: $bin not found (set OVOS_GUI_VENV, OVOS_VISAGE_APP or OVOS_VISAGE_DIR)"
+  done
+}
+
+# Switching between the native and browser Visage leaves the other one's
+# LaunchAgent behind, still starting at login, unless it is removed here.
+gui_remove_unwanted() {
+  local service wanted=" ${(j: :)${(f)"$(wanted_gui_services)"}} "
+  for service in $(installed_gui_services); do
+    [[ $wanted == *" $service "* ]] && continue
+    cmd_stop "$service"
+    rm -f "${_OVOS_LAUNCHD_PLIST_BY_SERVICE[$service]}"
+    print "removed $service"
   done
 }
 
@@ -487,14 +514,26 @@ gui_check_binaries() {
 gui_install() {
   local service plist
   gui_check_binaries
+  gui_remove_unwanted
   mkdir -p "$LOG_DIR" "$HOME/Library/LaunchAgents"
-  for service in $GUI_SERVICES; do
+  for service in $(wanted_gui_services); do
     plist="${_OVOS_LAUNCHD_PLIST_BY_SERVICE[$service]}"
     write_gui_plist "$service"
     plutil -lint -s "$plist" || die "generated an invalid plist: $plist"
     print "wrote $plist"
   done
   gui_each restart
+}
+
+gui_open() {
+  local -a installed=(${(f)"$(installed_gui_services)"})
+  if (( ${installed[(Ie)ovos-visage]} )); then
+    open "http://127.0.0.1:$VISAGE_PORT"
+  elif [[ -d $VISAGE_APP ]]; then
+    open "$VISAGE_APP"
+  else
+    die "no Visage installed (run 'ovosctl gui install')"
+  fi
 }
 
 gui_uninstall() {
@@ -507,7 +546,7 @@ gui_uninstall() {
 
 gui_each() {
   local action=$1 service
-  for service in $GUI_SERVICES; do
+  for service in $(installed_gui_services); do
     "cmd_$action" "$service" || return
   done
 }
@@ -518,7 +557,7 @@ cmd_gui() {
     install)            gui_install ;;
     uninstall)          gui_uninstall ;;
     start|stop|restart) gui_each "$action" ;;
-    open)               open "http://127.0.0.1:$VISAGE_PORT" ;;
+    open)               gui_open ;;
     status)
       for service in $(installed_gui_services); do
         print_service_status "$service"
@@ -562,7 +601,9 @@ Usage: ovosctl <command> [args]
                   ~/.config/mycroft/mycroft.conf.overlay.json. `check` (the
                   default) reports drift, `apply` merges them back.
   gui [status|install|uninstall|start|stop|restart|open]
-                  The browser GUI: ovos-gui, ovos-homescreen, ovos-visage.
+                  The GUI: ovos-gui, ovos-homescreen, and Visage, either the
+                  native app (ovos-visage-app) or, with OVOS_VISAGE_DIR set,
+                  the browser server (ovos-visage).
                   `install` writes their LaunchAgents and starts them. They
                   are separate from OVOS: `ovosctl stop` leaves them running.
                   Each one also takes start/stop/restart/logs by name.
