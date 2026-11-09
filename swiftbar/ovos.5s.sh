@@ -28,6 +28,10 @@ fi
 
 source "$HELPER"
 
+# The OVOS logo silhouette as an 18pt template image, so it follows the menu
+# bar's light or dark appearance. From OpenVoiceOS/ovos_assets (CC0).
+readonly OVOS_ICON="iVBORw0KGgoAAAANSUhEUgAAACQAAAAkCAYAAADhAJiYAAAACXBIWXMAABYlAAAWJQFJUiTwAAADy0lEQVR42u2YSWsUQRTHf13TJjGZGJMYo0bjmpvEJQfjggsIohf1rEERQUTw4EGNH8CL38CDCF5cAiLiQQQlIuhN9KIHF9w1ZEEngUSdaS//gufYk3RPQgSxoOiqV6/+9ept9WbgH2tBQtqkANM2pw5QUJ+Wlom5QBjDF8ZcOpPmkKQtMnsiYA9wFngMHADWA0PAeeA78Ey8BbN3Sv1kM1BvNHVUhw3rwAgYEe2Y0UwDsCWpi7gUmrkCbALyorXogJnAT/Uq0eaJJw9sAC4XYZUtkDNmqgRma74AOGIOCI3vRMBhYK7ms4EK4x5uMgL5iKkC6oAmzU8Ac6QBV4SXl4aOizZXeyuLMFML5IBqjas1r9H3oDSRKbHPaykAsuLLar1mvHNdzNyrfjdwX2MPVgFsBRp106AEZgFoBjYazdTo2wvsMqZ24+UMm9gWAR0az9R3DrDPRNV4gRAB+w2f13YHsETjn6WSWKCNrcAo0Ce7RwLyGuqUT0yU7Hxq2Cksr+WsMOtFa9Jl33oZik12DzitcbOYGoFa0doVYRPlFL/WCqwxAjVqzUdgt8784x2KxLRMIGizFyybJEImyGNZE6Uee7HObBKfc+Y2q0Scp3m9Eah2CjJ+rbAstk+g7V6z9qVeJ+Ga5QN1oreY8WRaHbDQJMuM8cdOb7HQmK1T0jZJiFrNF+qxnGxrUAqIZL4FxlTrvBwhMKYNa00iWyrvD4D5QG4KXux6YJYwq4HlOitQKigAYyFwTgI06OXOAtv0HQPagG/aGKR05hGTw5ZKqFFhb5HZcqJfA14DnFH4tck8vZL2EbBa5vqhWicy9U2S/sOMC7rgKuCh3rxeuccKydAdd7MuAfRoPijN3TIlRZSy5ySQT5I9ondR4u0KgRmaf9DaV5nIa+ZOGXW412avhMpp/zfR3+vMGV4OZ4qrvADeCcwL0qcNt42QSR3c+901Yfdr76Dob0XPezlcTEb9LKYhMw+A58Bd0fIJtRMAH4GbutQnreWE8bm4kiwWKBDzoL4IcETr51OYzT8zF4X33bjDIDAg3N80HpYA22FuM2AEeKKwrdSBbpyQzyjKLhjT9Wv9KvCg3ITWCZwyKf+LiZ64iCvIHyLx+mfnpDJy2b9GgxJ1zhs5/rDJNbbbUH9Vom4KSmnXTRCunscXXD4argPbgZcmbfg+DBwCLhkt+oLOGZPGljJhCufMCNxHyCO9QXtVO1cAT4EbwAtgpQkMlzAyEwlU3B4rBTgluIvqxaZ9rsc0VTIt59+PjFF5XG1dMGvBdP4b8r/9lfYLCEsWPAYiIokAAAAASUVORK5CYII="
+
 # Must stay in sync with GUI_SERVICES and gui_label in ovosctl.
 typeset -ra GUI_SERVICES=(ovos-gui ovos-homescreen ovos-visage ovos-visage-app)
 
@@ -75,16 +79,17 @@ gui_title_suffix() {
 # A partial state must look different from a healthy one at a glance, so only
 # an all-up system gets the bare icon.
 print_title() {
-  local running=$(count_running $installed) total=${#installed} suffix=$(gui_title_suffix)
+  local running=$(count_running $installed) total=${#installed} suffix=$(gui_title_suffix) state=""
   if (( total == 0 )); then
     print "OVOS ⚠️$suffix"
-  elif (( running == total )); then
-    print "🎙$suffix"
-  elif (( running == 0 )); then
-    print "🎙⚪️$suffix"
-  else
-    print "🎙 $running/$total$suffix"
+    return
   fi
+  if (( running == 0 )); then
+    state="off"
+  elif (( running < total )); then
+    state="$running/$total"
+  fi
+  print -r -- "$state$suffix | templateImage=$OVOS_ICON"
 }
 
 ovosctl_item() {

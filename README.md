@@ -126,8 +126,8 @@ ln -sf "$(brew --prefix)/share/ovos-mac-control/ovos.5s.sh" "$(defaults read com
 From a checkout, link `$PWD/swiftbar/ovos.5s.sh` instead.
 
 Point SwiftBar at a plugin folder on first launch; the command above links into
-whichever one you chose. The icon shows 🎙 when everything is up, `🎙 n/5` when
-partially up, and 🎙⚪️ when stopped.
+whichever one you chose. The menu bar shows the OVOS logo on its own when
+everything is up, with `n/5` beside it when partially up, and `off` when stopped.
 
 The dropdown has start/stop for everything, plus a submenu per service with
 start or stop, restart, and its logs. Each log opens in Console.app, which
