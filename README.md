@@ -82,28 +82,39 @@ two out of sync. Both commands coexist. `ovosctl` adds log rotation and waits
 for a full shutdown, for one service or all of them, and accepts short names
 (`core`, `audio`) as well as full ones (`ovos-core`).
 
-## Browser GUI (always on)
+## GUI (always on)
 
-`ovosctl gui install` writes LaunchAgents for the browser GUI stack and starts
-it:
+`ovosctl gui install` writes LaunchAgents for the GUI stack and starts it:
 
-| service           | runs                                                           |
-|-------------------|----------------------------------------------------------------|
-| `ovos-gui`        | `ovos-gui-service` from `~/.venvs/ovos-gui`                    |
+| service           | runs                                                               |
+|-------------------|--------------------------------------------------------------------|
+| `ovos-gui`        | `ovos-gui-service` from `~/.venvs/ovos-gui`                        |
 | `ovos-homescreen` | `ovos-skill-launcher ovos-skill-homescreen.openvoiceos`, same venv |
-| `ovos-visage`     | `ovos-visage` from the checkout's `.venv`, on port 8766        |
+| `ovos-visage-app` | the native [OVOS Visage](https://github.com/OscillateLabsLLC/ovos-gui-visage) app |
+| `ovos-visage`     | the browser Visage server, on port 8766, instead of the app        |
 
-Override the paths with `OVOS_GUI_VENV` and `OVOS_VISAGE_DIR`. Labels are
+Visage is the native app when it's installed:
+
+```zsh
+brew trust --cask oscillatelabsllc/tap/ovos-gui-visage
+brew install --cask oscillatelabsllc/tap/ovos-gui-visage
+```
+
+To use the browser version instead, set `OVOS_VISAGE_DIR` to an
+[ovos-visage](https://github.com/OscillateLabsLLC/ovos-visage) checkout before
+`install`. It runs from the checkout's `.venv`, so a branch checked out there is
+what the service runs after its next restart. Switching between the two and
+re-running `install` removes the other one's LaunchAgent.
+
+Override the other paths with `OVOS_GUI_VENV` and `OVOS_VISAGE_APP`. Labels are
 `com.oscillatelabs.<service>`, and logs go to the same folder as OVOS's own.
 
 They are deliberately not part of the OVOS service set: `ovosctl stop` leaves
 them up, and they reconnect when the messagebus returns. Control them as a
 group with `ovosctl gui start|stop|restart|status|open`, or one at a time by
-name (`ovosctl restart visage`, `ovosctl logs gui err`). Re-run `install`
-after changing a path; a loaded launchd job keeps its old definition.
-
-ovos-visage runs from the checkout, so a branch checked out there is what the
-service runs after its next restart.
+name (`ovosctl restart visage-app`, `ovosctl logs gui err`). Re-run `install`
+after changing a path; a loaded launchd job keeps its old definition. If you
+quit the app, it stays closed until `ovosctl gui start`.
 
 ## Menubar switch (SwiftBar)
 

@@ -28,9 +28,8 @@ fi
 
 source "$HELPER"
 
-# Must stay in sync with GUI_SERVICES, gui_label and VISAGE_PORT in ovosctl.
-typeset -ra GUI_SERVICES=(ovos-gui ovos-homescreen ovos-visage)
-readonly VISAGE_URL="http://127.0.0.1:8766"
+# Must stay in sync with GUI_SERVICES and gui_label in ovosctl.
+typeset -ra GUI_SERVICES=(ovos-gui ovos-homescreen ovos-visage ovos-visage-app)
 
 for service in $GUI_SERVICES; do
   _OVOS_LAUNCHD_LABEL_BY_SERVICE[$service]="com.oscillatelabs.$service"
@@ -146,7 +145,7 @@ print_gui_actions() {
   local running=$(count_running $gui_installed) total=${#gui_installed}
   if (( running == total )); then
     print "GUI is running | color=green"
-    print "Open Visage | href=$VISAGE_URL"
+    ovosctl_item "Open Visage" gui open
     ovosctl_item "Stop GUI" gui stop
   elif (( running == 0 )); then
     print "GUI is stopped | color=gray"
